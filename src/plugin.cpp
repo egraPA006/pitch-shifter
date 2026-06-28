@@ -6,16 +6,17 @@
 
 // WSOLA tuned for 256 frames / 48 kHz.
 // WIN = 2×HOP → 50% overlap; Hann window satisfies COLA at this ratio.
-static constexpr int HOP     = 256;
-static constexpr int WIN     = 512;
-static constexpr int RING    = 1 << 15;  // 32768 samples ≈ 0.68 s @ 48 kHz
+// HOP = 128 so two WSOLA steps fit inside one 256-sample host block.
+static constexpr int HOP      = 128;
+static constexpr int WIN      = 256;       // 5.3 ms @ 48 kHz
+static constexpr int RING     = 1 << 15;   // 32768 samples ≈ 0.68 s @ 48 kHz
 static constexpr int RING_MSK = RING - 1;
-static constexpr int MIN_GAP = WIN + HOP; // absolute minimum read-behind-write distance
+static constexpr int MIN_GAP  = WIN + HOP; // absolute minimum read-behind-write distance
 
 // Tuneable defaults (also the CLAP param defaults)
-static constexpr int DEF_SEARCH      = 64;    // cross-correlation search range (samples)
-static constexpr int DEF_JUMP_BACK   = 512;   // nominal jump size on gap underflow (samples)
-static constexpr int DEF_INITIAL_GAP = 2048;  // initial/target rd-behind-wr gap (samples) = latency
+static constexpr int DEF_SEARCH      = 32;   // cross-correlation search range (samples)
+static constexpr int DEF_JUMP_BACK   = 256;  // nominal jump size on gap underflow (samples)
+static constexpr int DEF_INITIAL_GAP = 512;  // initial/target rd-behind-wr gap ≈ 10.7 ms = latency
 
 static float s_hann[WIN];
 static void  build_hann() {
@@ -128,12 +129,12 @@ static const clap_param_info_t k_params[PARAM_COUNT] = {
     {
         .id = PARAM_SEARCH, .flags = 0,
         .cookie = nullptr, .name = "Search Range", .module = "WSOLA",
-        .min_value = 8.0, .max_value = 256.0, .default_value = DEF_SEARCH,
+        .min_value = 4.0, .max_value = 128.0, .default_value = DEF_SEARCH,
     },
     {
         .id = PARAM_JUMP_BACK, .flags = 0,
         .cookie = nullptr, .name = "Jump Back", .module = "WSOLA",
-        .min_value = static_cast<double>(HOP), .max_value = static_cast<double>(HOP * 8),
+        .min_value = static_cast<double>(HOP), .max_value = static_cast<double>(HOP * 16),
         .default_value = DEF_JUMP_BACK,
     },
     {
@@ -208,13 +209,14 @@ static clap_process_status plugin_process(const clap_plugin_t* p,
 
     for (uint32_t c = 0; c < nch; ++c) {
         s->ch[c].push(ain.data32[c], static_cast<int>(nfr));
-        if (nfr >= HOP) {
-            s->ch[c].step(aout.data32[c], ratio, s->search, s->jump_back, s->initial_gap);
-            if (nfr > HOP)
-                std::memset(aout.data32[c] + HOP, 0, (nfr - HOP) * sizeof(float));
-        } else {
-            std::memset(aout.data32[c], 0, nfr * sizeof(float));
+        int done = 0;
+        while (done + HOP <= static_cast<int>(nfr)) {
+            s->ch[c].step(aout.data32[c] + done, ratio, s->search, s->jump_back, s->initial_gap);
+            done += HOP;
         }
+        // Zero any trailing samples if nfr is not a multiple of HOP
+        if (done < static_cast<int>(nfr))
+            std::memset(aout.data32[c] + done, 0, (nfr - done) * sizeof(float));
     }
     return CLAP_PROCESS_CONTINUE;
 }
