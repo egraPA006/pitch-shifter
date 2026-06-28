@@ -4,19 +4,23 @@
 #include <cstdio>
 #include <cstring>
 
-// WSOLA tuned for 256 frames / 48 kHz.
-// WIN = 2×HOP → 50% overlap; Hann window satisfies COLA at this ratio.
-// HOP = 128 so two WSOLA steps fit inside one 256-sample host block.
+// WSOLA + linear resampler pitch shifter.
+// Pipeline: input → WSOLA (time-stretch by 1/ratio, H_a = HOP/ratio)
+//                 → linear resampler (compress by ratio) → output
+// Group delay = initial_gap samples, constant for all pitch ratios.
+//
+// HOP = 128, WIN = 256: two WSOLA steps per 256-sample host block.
 static constexpr int HOP      = 128;
-static constexpr int WIN      = 256;       // 5.3 ms @ 48 kHz
-static constexpr int RING     = 1 << 15;   // 32768 samples ≈ 0.68 s @ 48 kHz
+static constexpr int WIN      = 256;
+static constexpr int RING     = 1 << 15;   // 32768 input ring ≈ 0.68 s @ 48 kHz
 static constexpr int RING_MSK = RING - 1;
-static constexpr int MIN_GAP  = WIN + HOP; // absolute minimum read-behind-write distance
+static constexpr int MIN_GAP  = WIN + HOP; // 384 — minimum safe read distance
+static constexpr int MAX_GAP  = RING - MIN_GAP;
+static constexpr int IBUF     = 4096;      // intermediate ring (WSOLA output)
 
-// Tuneable defaults (also the CLAP param defaults)
-static constexpr int DEF_SEARCH      = 32;   // cross-correlation search range (samples)
-static constexpr int DEF_JUMP_BACK   = 256;  // nominal jump size on gap underflow (samples)
-static constexpr int DEF_INITIAL_GAP = 512;  // initial/target rd-behind-wr gap ≈ 10.7 ms = latency
+static constexpr int DEF_SEARCH      = 32;
+static constexpr int DEF_JUMP_BACK   = 256;
+static constexpr int DEF_INITIAL_GAP = 512;  // ≈ 10.7 ms @ 48 kHz
 
 static float s_hann[WIN];
 static void  build_hann() {
@@ -24,23 +28,34 @@ static void  build_hann() {
         s_hann[i] = 0.5f * (1.f - cosf(2.f * M_PI * i / WIN));
 }
 
-// ── Per-channel WSOLA state ───────────────────────────────────────────────────
+// ── Per-channel state ─────────────────────────────────────────────────────────
 
 struct Chan {
+    // Stage 1: input ring buffer
     float   ring[RING] = {};
-    float   olap[WIN]  = {};
-    float   prev[WIN]  = {};
     int64_t wr   = 0;
-    double  rd   = 0.0;
+    double  rd   = 0.0;      // analysis read head (absolute, fractional); advances by HOP/ratio
+
+    // OLA accumulator + previous grain (for cross-correlation)
+    float   olap[WIN] = {};
+    float   prev[WIN] = {};
     bool    warm = false;
+
+    // Stage 2: intermediate buffer (WSOLA output, consumed by resampler)
+    float  ibuf[IBUF + 2] = {};  // +2: linear interpolation always reads ibuf[pos] and [pos+1]
+    int    ibuf_fill = 0;
+    double iread     = 0.0;      // fractional read position into ibuf
 
     void reset(int initial_gap) {
         std::memset(ring, 0, sizeof ring);
         std::memset(olap, 0, sizeof olap);
         std::memset(prev, 0, sizeof prev);
-        wr   = initial_gap;
-        rd   = 0.0;
-        warm = false;
+        std::memset(ibuf, 0, sizeof ibuf);
+        wr        = initial_gap;
+        rd        = 0.0;
+        ibuf_fill = 0;
+        iread     = 0.0;
+        warm      = false;
     }
 
     void push(const float* in, int n) {
@@ -49,8 +64,6 @@ struct Chan {
         wr += n;
     }
 
-    // Normalized cross-correlation of prev vs ring[base+d .. +WIN) for d in [-range, range].
-    // Returns absolute position of the best match.
     int64_t best_match(int64_t base, int range, float prev_energy) const {
         int64_t best_pos = base;
         float   best_c   = -2.f;
@@ -67,46 +80,80 @@ struct Chan {
         return best_pos;
     }
 
-    void step(float* out, double ratio, int search, int jump_back, int initial_gap) {
+    // One WSOLA step: reads H_a = HOP/ratio input samples, writes HOP intermediate samples.
+    //
+    // Gap dynamics (H_a = HOP/ratio):
+    //   pitch-up   (ratio > 1): H_a < HOP → gap GROWS → overflow when gap > MAX_GAP
+    //   pitch-down (ratio < 1): H_a > HOP → gap SHRINKS → underflow when gap < MIN_GAP
+    void wsola_step(double ratio, int search, int jump_back, int initial_gap) {
         const int64_t gap = wr - static_cast<int64_t>(rd);
-        const int     max_gap = RING - MIN_GAP - search;
 
         float prev_energy = 0.f;
         if (warm)
             for (int i = 0; i < WIN; ++i) prev_energy += prev[i] * prev[i];
 
-        // ── Gap management ────────────────────────────────────────────────────
         int64_t gp;
         if (gap < MIN_GAP + search) {
-            // Pitch up: rd caught up to wr — jump back by jump_back, find best splice
+            // Pitch-down: rd racing ahead of wr → jump back, find best splice
             const int64_t nominal = static_cast<int64_t>(rd) - jump_back;
             gp = warm ? best_match(nominal, search, prev_energy) : nominal;
             rd = static_cast<double>(gp);
-        } else if (gap > max_gap) {
-            // Pitch down: wr ran ahead of rd — skip rd forward to restore target gap
+        } else if (gap > MAX_GAP) {
+            // Pitch-up: gap too large → skip rd forward to restore target gap
             const int64_t nominal = static_cast<int64_t>(wr) - initial_gap;
             gp = warm ? best_match(nominal, search, prev_energy) : nominal;
             rd = static_cast<double>(gp);
         } else {
-            // Normal: WSOLA search around nominal rd
             gp = warm ? best_match(static_cast<int64_t>(rd), search, prev_energy)
                       : static_cast<int64_t>(rd);
         }
 
-        // ── Extract windowed grain ────────────────────────────────────────────
+        // Extract windowed grain
         float grain[WIN];
         for (int i = 0; i < WIN; ++i)
             grain[i] = ring[(gp + i) & RING_MSK] * s_hann[i];
 
-        // ── Overlap-add → output → shift ──────────────────────────────────────
+        // Overlap-add into olap, then copy HOP samples to intermediate buffer
         for (int i = 0; i < WIN; ++i) olap[i] += grain[i];
-        std::memcpy(out, olap, HOP * sizeof(float));
+
+        const int space = IBUF - ibuf_fill;
+        std::memcpy(ibuf + ibuf_fill, olap, std::min(HOP, space) * sizeof(float));
+        ibuf_fill = std::min(ibuf_fill + HOP, IBUF);
+
         std::memmove(olap, olap + HOP, (WIN - HOP) * sizeof(float));
         std::memset(olap + WIN - HOP, 0, HOP * sizeof(float));
 
         std::memcpy(prev, grain, WIN * sizeof(float));
         warm  = true;
-        rd   += HOP * ratio;
+        rd   += HOP / ratio;   // ← key: shorter hop for pitch-up, longer for pitch-down
+    }
+
+    void process(const float* in, float* out, int n, double ratio,
+                 int search, int jump_back, int initial_gap) {
+        push(in, n);
+
+        // Compact intermediate buffer: discard fully-consumed samples
+        const int consumed = static_cast<int>(iread);
+        if (consumed > 0 && consumed <= ibuf_fill) {
+            ibuf_fill -= consumed;
+            // Shift remaining + 2 headroom bytes so interpolation stays valid
+            std::memmove(ibuf, ibuf + consumed, (ibuf_fill + 2) * sizeof(float));
+            iread -= consumed;
+        }
+
+        // Run WSOLA steps until intermediate has enough for the resampler.
+        // Resampler consumes n*ratio intermediate samples to produce n output samples.
+        const int needed = static_cast<int>(std::ceil(n * ratio)) + WIN + 2;
+        while (ibuf_fill < needed)
+            wsola_step(ratio, search, jump_back, initial_gap);
+
+        // Linear interpolation resampler: advances iread by ratio per output sample
+        for (int i = 0; i < n; ++i) {
+            const int   pos  = static_cast<int>(iread);
+            const float frac = static_cast<float>(iread - pos);
+            out[i] = ibuf[pos] * (1.f - frac) + ibuf[pos + 1] * frac;
+            iread += ratio;
+        }
     }
 };
 
@@ -114,15 +161,16 @@ struct Chan {
 
 enum : clap_id {
     PARAM_SEMITONES = 0,
-    PARAM_SEARCH,       // WSOLA search range (samples)
-    PARAM_JUMP_BACK,    // jump-back size on gap underflow (samples)
-    PARAM_INITIAL_GAP,  // initial/target gap = reported latency (samples)
+    PARAM_SEARCH,
+    PARAM_JUMP_BACK,
+    PARAM_INITIAL_GAP,
     PARAM_COUNT,
 };
 
 static const clap_param_info_t k_params[PARAM_COUNT] = {
     {
-        .id = PARAM_SEMITONES, .flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE,
+        .id = PARAM_SEMITONES,
+        .flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE,
         .cookie = nullptr, .name = "Pitch", .module = "",
         .min_value = -24.0, .max_value = 24.0, .default_value = 0.0,
     },
@@ -134,13 +182,15 @@ static const clap_param_info_t k_params[PARAM_COUNT] = {
     {
         .id = PARAM_JUMP_BACK, .flags = 0,
         .cookie = nullptr, .name = "Jump Back", .module = "WSOLA",
-        .min_value = static_cast<double>(HOP), .max_value = static_cast<double>(HOP * 16),
+        .min_value = static_cast<double>(HOP),
+        .max_value = static_cast<double>(HOP * 16),
         .default_value = DEF_JUMP_BACK,
     },
     {
         .id = PARAM_INITIAL_GAP, .flags = 0,
         .cookie = nullptr, .name = "Latency / Gap", .module = "WSOLA",
-        .min_value = static_cast<double>(WIN + HOP), .max_value = static_cast<double>(RING / 4),
+        .min_value = static_cast<double>(WIN + HOP),
+        .max_value = static_cast<double>(RING / 4),
         .default_value = DEF_INITIAL_GAP,
     },
 };
@@ -207,17 +257,10 @@ static clap_process_status plugin_process(const clap_plugin_t* p,
     const uint32_t nfr   = proc->frames_count;
     const double   ratio = std::pow(2.0, s->semitones / 12.0);
 
-    for (uint32_t c = 0; c < nch; ++c) {
-        s->ch[c].push(ain.data32[c], static_cast<int>(nfr));
-        int done = 0;
-        while (done + HOP <= static_cast<int>(nfr)) {
-            s->ch[c].step(aout.data32[c] + done, ratio, s->search, s->jump_back, s->initial_gap);
-            done += HOP;
-        }
-        // Zero any trailing samples if nfr is not a multiple of HOP
-        if (done < static_cast<int>(nfr))
-            std::memset(aout.data32[c] + done, 0, (nfr - done) * sizeof(float));
-    }
+    for (uint32_t c = 0; c < nch; ++c)
+        s->ch[c].process(ain.data32[c], aout.data32[c], static_cast<int>(nfr),
+                         ratio, s->search, s->jump_back, s->initial_gap);
+
     return CLAP_PROCESS_CONTINUE;
 }
 
@@ -253,9 +296,9 @@ static bool par_info(const clap_plugin_t*, uint32_t i, clap_param_info_t* o) {
     *o = k_params[i]; return true;
 }
 static bool par_get(const clap_plugin_t* p, clap_id id, double* v) {
-    auto* s = self(p);
+    const auto* s = self(p);
     switch (id) {
-        case PARAM_SEMITONES:   *v = s->semitones;             return true;
+        case PARAM_SEMITONES:   *v = s->semitones;                      return true;
         case PARAM_SEARCH:      *v = static_cast<double>(s->search);      return true;
         case PARAM_JUMP_BACK:   *v = static_cast<double>(s->jump_back);   return true;
         case PARAM_INITIAL_GAP: *v = static_cast<double>(s->initial_gap); return true;
@@ -265,10 +308,10 @@ static bool par_get(const clap_plugin_t* p, clap_id id, double* v) {
 static bool par_to_text(const clap_plugin_t*, clap_id id, double v,
                          char* buf, uint32_t sz) {
     switch (id) {
-        case PARAM_SEMITONES:   snprintf(buf, sz, "%.2f st", v);         return true;
-        case PARAM_SEARCH:      snprintf(buf, sz, "%d smp", (int)v);     return true;
-        case PARAM_JUMP_BACK:   snprintf(buf, sz, "%d smp", (int)v);     return true;
-        case PARAM_INITIAL_GAP: snprintf(buf, sz, "%d smp", (int)v);     return true;
+        case PARAM_SEMITONES:   snprintf(buf, sz, "%.2f st", v);     return true;
+        case PARAM_SEARCH:
+        case PARAM_JUMP_BACK:
+        case PARAM_INITIAL_GAP: snprintf(buf, sz, "%d smp", (int)v); return true;
     }
     return false;
 }
@@ -300,7 +343,7 @@ static const clap_plugin_descriptor_t k_desc = {
     .vendor       = "Example",
     .url          = "", .manual_url = "", .support_url = "",
     .version      = "0.1.0",
-    .description  = "WSOLA pitch shifter — 256 / 48 kHz",
+    .description  = "WSOLA + resampler pitch shifter — 256 / 48 kHz",
     .features     = (const char*[]){
         CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
         CLAP_PLUGIN_FEATURE_PITCH_SHIFTER,
