@@ -12,11 +12,9 @@ if not cpp.has_header('clap/clap.h')
   error('CLAP SDK headers not found — enter the Nix dev shell first')
 endif
 
-rubberband_dep = dependency('rubberband')
-
 shared_library('pitch-shifter',
   sources: files('src/plugin.cpp'),
-  dependencies: [rubberband_dep],
+  dependencies: [],
   name_prefix: '',
   name_suffix: 'clap',
   install: true,

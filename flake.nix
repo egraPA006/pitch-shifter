@@ -18,7 +18,6 @@
             pkg-config
             clang
             clap
-            rubberband
           ];
 
           shellHook = ''
