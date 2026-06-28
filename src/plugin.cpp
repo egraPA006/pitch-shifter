@@ -79,17 +79,17 @@ struct Chan {
 
 // ── Parameters ────────────────────────────────────────────────────────────────
 
-enum : clap_id { PARAM_RATIO = 0, PARAM_COUNT };
+enum : clap_id { PARAM_SEMITONES = 0, PARAM_COUNT };
 
 static const clap_param_info_t k_params[PARAM_COUNT] = {{
-    .id            = PARAM_RATIO,
+    .id            = PARAM_SEMITONES,
     .flags         = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE,
     .cookie        = nullptr,
-    .name          = "Pitch Ratio",
+    .name          = "Pitch",
     .module        = "",
-    .min_value     = 0.5,
-    .max_value     = 2.0,
-    .default_value = 1.0,
+    .min_value     = -24.0,
+    .max_value     =  24.0,
+    .default_value =   0.0,
 }};
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ static const clap_param_info_t k_params[PARAM_COUNT] = {{
 struct PitchShifter {
     clap_plugin_t      plugin;
     const clap_host_t* host;
-    double             ratio = 1.0;
+    double             semitones = 0.0;
     Chan               ch[2];
 };
 
@@ -128,7 +128,7 @@ static void apply_params(PitchShifter* s, const clap_input_events_t* ev) {
         const auto* hdr = ev->get(ev, i);
         if (hdr->type != CLAP_EVENT_PARAM_VALUE) continue;
         const auto* e = reinterpret_cast<const clap_event_param_value_t*>(hdr);
-        if (e->param_id == PARAM_RATIO) s->ratio = e->value;
+        if (e->param_id == PARAM_SEMITONES) s->semitones = e->value;
     }
 }
 
@@ -148,7 +148,7 @@ static clap_process_status plugin_process(const clap_plugin_t* p,
     for (uint32_t c = 0; c < nch; ++c) {
         s->ch[c].push(ain.data32[c], static_cast<int>(nfr));
         if (nfr >= HOP) {
-            s->ch[c].step(aout.data32[c], s->ratio);
+            s->ch[c].step(aout.data32[c], std::pow(2.0, s->semitones / 12.0));
             if (nfr > HOP)
                 std::memset(aout.data32[c] + HOP, 0, (nfr - HOP) * sizeof(float));
         } else {
@@ -183,12 +183,12 @@ static bool par_info(const clap_plugin_t*, uint32_t i, clap_param_info_t* o) {
     *o = k_params[i]; return true;
 }
 static bool par_get(const clap_plugin_t* p, clap_id id, double* v) {
-    if (id == PARAM_RATIO) { *v = self(p)->ratio; return true; }
+    if (id == PARAM_SEMITONES) { *v = self(p)->semitones; return true; }
     return false;
 }
 static bool par_to_text(const clap_plugin_t*, clap_id id, double v,
                          char* buf, uint32_t sz) {
-    if (id == PARAM_RATIO) { snprintf(buf, sz, "x%.3f", v); return true; }
+    if (id == PARAM_SEMITONES) { snprintf(buf, sz, "%.2f st", v); return true; }
     return false;
 }
 static bool par_from_text(const clap_plugin_t*, clap_id, const char*, double*) {
